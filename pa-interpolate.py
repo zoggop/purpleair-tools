@@ -21,11 +21,18 @@ import pickle
 import datetime
 import subprocess
 import re
-from colormath.color_objects import sRGBColor, LCHabColor
+from colormath.color_objects import sRGBColor, LCHabColor, LabColor
 from colormath.color_conversions import convert_color
 import concurrent.futures
 import threading
 import time
+
+# station IDs to exclude
+excludeList = [66405, 35379]
+
+excludedIDs = {}
+for sid in excludeList:
+	excludedIDs[sid] = True
 
 lonBounds = [-123.72, -122.16] # [-124.67, -121.65] # [-125, -102]
 latBounds = [42.01, 42.61] # [41.00, 42.99] #[29, 50]
@@ -50,19 +57,22 @@ conBreaks = [0, 23.7, 45.4, 102.9, 200.4, 300.4]
 breakHexes = ['#07e600', '#fbff00', '#fa8003', '#fa040b', '#903a99', '#7c001f']
 breaksRGBs = []
 breaksLCHs = []
+breaksLABs = []
 breakColors = []
 for hexColor in breakHexes:
 	srgb = sRGBColor.new_from_rgb_hex(hexColor)
 	lch = convert_color(srgb, LCHabColor)
+	lab = convert_color(srgb, LabColor)
 	breaksRGBs.append(srgb)
 	breaksLCHs.append(lch)
+	breaksLABs.append(lab)
 	breakColors.append(list(srgb.get_value_tuple()))
 	# print(hexColor, srgb, lch, list(srgb.get_value_tuple()))
 
 def gradientColor(con, model):
 	index = None
 	for i in range(0, len(conBreaks)-1):
-		if con == int(conBreaks[i]):
+		if con == conBreaks[i]:
 			return breakColors[i]
 		elif con > conBreaks[i] and con < conBreaks[i+1]:
 			index = i
@@ -95,22 +105,35 @@ def gradientColor(con, model):
 		green = a.rgb_g + ((b.rgb_g - a.rgb_g) * conAboveA)
 		blue = a.rgb_b + ((b.rgb_b - a.rgb_b) * conAboveA)
 		srgb = sRGBColor(red, green, blue)
+	elif model == 'lab':
+		first = breaksLABs[index]
+		second = breaksLABs[index+1]
+		l = first.lab_l + ((second.lab_l - first.lab_l) * conAboveA)
+		a = first.lab_a + ((second.lab_a - first.lab_a) * conAboveA)
+		b = first.lab_b + ((second.lab_b - first.lab_b) * conAboveA)
+		srgb = convert_color(LabColor(l, a, b), sRGBColor)
 	# return [int(srgb.clamped_rgb_r * 255), int(srgb.clamped_rgb_g * 255), int(srgb.clamped_rgb_b * 255)]
 	return [srgb.clamped_rgb_r, srgb.clamped_rgb_g, srgb.clamped_rgb_b]
 
-gradient = []
 startDT = datetime.datetime.now()
-for con in range(int(conBreaks[0]), int(conBreaks[-1])):
-	gradient.append(gradientColor(con, 'rgb'))
-print('created gradient in', datetime.datetime.now() - startDT)
+gradient = {}
+for con in np.arange(conBreaks[0], conBreaks[-1], 0.1):
+	con = round(con,1)
+	gradient[con] = gradientColor(con, 'lab')
+	# print(con, gradient[con])
+	# gradient.append(gradientColor(con, 'rgb'))
 
 def colorFromGradient(con):
 	if np.isnan(con):
-		return gradient[0]
-	elif con > len(gradient)-1:
-		return gradient[-1]
+		# print("NaN color")
+		return gradient.get(conBreaks[0])
 	else:
-		return gradient[int(con)]
+		color = gradient.get(round(con,1))
+		if color == None:
+			# print(con, round(con,1))
+			return gradient.get(conBreaks[-1])
+		else:
+			return color
 
 def getMyLocation():
 	import geocoder
@@ -181,6 +204,10 @@ def getRelevantSensors():
 def epaCorrect(s):
 	if s.parent.channel_data.get('pm2_5_cf_1') == None or s.child.channel_data.get('pm2_5_cf_1') == None:
 		return None
+	if abs(s.parent.d1avg - s.child.d1avg) > 5:
+		# channels must agree
+		print(s.parent.identifier, s.parent.name)
+		return None
 	a = float(s.parent.channel_data.get('pm2_5_cf_1'))
 	b = float(s.child.channel_data.get('pm2_5_cf_1'))
 	avgAB = (a + b) / 2
@@ -213,17 +240,28 @@ def aqiFromConcentration(epa):
 		# print('NaN aqi', epa)
 	return aqi
 
+aqiByCon = {}
+for con in np.arange(0, BPs[-1][1], 0.1):
+	con = round(con, 1)
+	aqiByCon[con] = int(aqiFromConcentration(con))
+
+def aqiFast(epa):
+	return aqiByCon.get(round(epa,1)) or aqiFromConcentration(epa)
+
 def pollSensor(entry):
 	sid = entry['index']
 	entry['sensor'] = Sensor(sid)
 
 def pollAllSensors(entries):
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-        executor.map(pollSensor, entries)
+	startDT = datetime.datetime.now()
+	with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+		executor.map(pollSensor, entries)
+	print("downloaded individual sensor data in", datetime.datetime.now() - startDT)
+
 
 centerLatLon = getMyLocation()
-lonBounds = [centerLatLon[1] - 0.75, centerLatLon[1] + 0.75]
-latBounds = [centerLatLon[0] - 0.3, centerLatLon[0] + 0.3]
+lonBounds = [centerLatLon[1] - 1, centerLatLon[1] + 1]
+latBounds = [centerLatLon[0] - 0.4, centerLatLon[0] + 0.4]
 
 lonBoundsRange = lonBounds[1] - lonBounds[0]
 latBoundsRange = latBounds[1] - latBounds[0]
@@ -237,11 +275,12 @@ zMin, zMax = None, None
 nowDT = datetime.datetime.utcnow()
 pollList = []
 for entry in relevant:
-	lon = entry['lon']
-	lat = entry['lat']
-	if lon > sensorLonBounds[0] and lon < sensorLonBounds[1] and lat > sensorLatBounds[0] and lat < sensorLatBounds[1]:
-		sid = entry['index']
-		pollList.append(entry)
+	if not excludedIDs.get(entry['index']):
+		lon = entry['lon']
+		lat = entry['lat']
+		if lon > sensorLonBounds[0] and lon < sensorLonBounds[1] and lat > sensorLatBounds[0] and lat < sensorLatBounds[1]:
+			sid = entry['index']
+			pollList.append(entry)
 pollAllSensors(pollList)
 for entry in pollList:
 	lon = entry['lon']
@@ -252,7 +291,7 @@ for entry in pollList:
 	# print(age, age.seconds)
 	if age.days == 0 and age.seconds < 3600:
 		con = epaCorrect(s)
-		if not con == None:
+		if con:
 			x.append(lon)
 			y.append(lat)
 			z.append(con)
@@ -281,11 +320,14 @@ rgbMap = np.zeros([zi.shape[0], zi.shape[1], 3])
 for i, con in np.ndenumerate(zi):
 	rgb = colorFromGradient(con)
 	rgbMap[i] = rgb
+	if int(aqiFast(con)) == 125:
+		if rgb[2] > rgb[1]:
+			print(con, round(con,1), rgb)
 
 # create map of aqi values
 aqiMap = np.zeros([zi.shape[0], zi.shape[1]])
 for i, con in np.ndenumerate(zi):
-	aqi = aqiFromConcentration(con)
+	aqi = aqiFast(con)
 	aqiMap[i] = int(aqi)
 
 def image_spoof(self, tile): # this function pretends not to be a Python script
